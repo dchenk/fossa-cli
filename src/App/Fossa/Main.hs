@@ -7,16 +7,18 @@ module App.Fossa.Main (
 import App.Fossa.Analyze (
   BinaryDiscoveryMode (..),
   IATAssertionMode (..),
-  IncludeAll (IncludeAll),
-  JsonOutput (..),
   ModeOptions (ModeOptions),
   ScanDestination (..),
-  UnpackArchives (..),
   VSIAnalysisMode (..),
   analyzeMain,
  )
 import App.Fossa.Analyze.Log4jReport (analyzeForLog4j)
-import App.Fossa.Analyze.Types (AnalyzeExperimentalPreferences (..))
+import App.Fossa.Analyze.Types (
+  AnalyzeExperimentalPreferences (..),
+  IncludeAll (IncludeAll),
+  JsonOutput (JsonOutput),
+  UnpackArchives (UnpackArchives),
+ )
 import App.Fossa.Configuration (
   ConfigFile (
     configApiKey,

@@ -11,10 +11,12 @@ module App.Fossa.Analyze.Log4jReport (
   parseSimplifiedVersion,
 ) where
 
-import App.Fossa.Analyze (DiscoverFunc (DiscoverFunc), runDependencyAnalysis, updateProgress)
-import App.Fossa.Analyze.Project (ProjectResult (..))
+import App.Fossa.Analyze (DiscoverFunc (DiscoverFunc), applyFiltersToProject, updateProgress)
+import App.Fossa.Analyze.Debug
+import App.Fossa.Analyze.Project (ProjectResult (..), mkResult)
 import App.Fossa.Analyze.Types (
   AnalyzeExperimentalPreferences (..),
+  AnalyzeProject (analyzeProject),
   AnalyzeTaskEffs,
  )
 import App.Types (
@@ -22,21 +24,27 @@ import App.Types (
  )
 import App.Util (validateDir)
 import Control.Carrier.AtomicCounter (AtomicCounter, runAtomicCounter)
-import Control.Carrier.Debug (ignoreDebug)
+import Control.Carrier.Debug (debugMetadata, ignoreDebug)
 import Control.Carrier.Diagnostics qualified as Diag
-import Control.Carrier.Finally (Has, runFinally)
+import Control.Carrier.Finally (runFinally)
 import Control.Carrier.Lift (Lift)
-import Control.Carrier.Output.IO (runOutput)
+import Control.Carrier.Output.IO (output, runOutput)
 import Control.Carrier.Reader (runReader)
-import Control.Carrier.Stack (runStack)
+import Control.Carrier.Stack (runStack, withEmptyStack)
+import Control.Carrier.Stack.StickyLog
 import Control.Carrier.StickyLogger (runStickyLogger)
 import Control.Carrier.TaskPool (
   TaskPool,
   withTaskPool,
  )
 import Control.Concurrent (getNumCapabilities)
+import Control.Effect.Debug (Debug)
 import Control.Effect.Lift (sendIO)
 import Control.Effect.Output (Output)
+import Control.Effect.Reader (Reader)
+import Control.Effect.Stack (Stack)
+import Control.Monad.IO.Class (MonadIO)
+import Data.Aeson qualified as Aeson
 import Data.Foldable (traverse_)
 import Data.List qualified as List
 import Data.Map qualified as Map
@@ -48,15 +56,17 @@ import Data.Void (Void)
 import DepTypes (Dependency (..), VerConstraint)
 import Discovery.Filters (AllFilters (AllFilters), FilterCombination (FilterCombination))
 import Discovery.Projects (withDiscoveredProjects)
-import Effect.Exec (runExecIO)
+import Effect.Exec
 import Effect.Logger (
   Logger,
-  Severity (SevInfo),
+  Severity (SevInfo, SevWarn),
+  logInfo,
   logStdout,
   renderIt,
+  viaShow,
   withDefaultLogger,
  )
-import Effect.ReadFS (runReadFSIO)
+import Effect.ReadFS (ReadFS, runReadFSIO)
 import Graphing (directList, getRootsOf, hasPredecessors, vertexList)
 import Path
 import Prettyprinter (Doc, Pretty (pretty), annotate, vsep)
@@ -69,6 +79,7 @@ import Strategy.Scala qualified as Scala
 import Text.Megaparsec (Parsec, parse)
 import Text.Megaparsec.Char (char)
 import Text.Megaparsec.Char.Lexer (decimal)
+import Types (DiscoveredProject (projectData, projectPath, projectType))
 
 type Parser = Parsec Void Text
 
@@ -126,7 +137,36 @@ runAnalyzersForLog4j basedir filters = do
     , DiscoverFunc Scala.discover
     ]
   where
-    single (DiscoverFunc f) = withDiscoveredProjects f basedir (runDependencyAnalysis basedir filters)
+    single (DiscoverFunc f) = withDiscoveredProjects f basedir (runDependencyAnalysisForLog4j basedir filters)
+
+runDependencyAnalysisForLog4j ::
+  ( AnalyzeProject proj
+  , Aeson.ToJSON proj
+  , Has (Lift IO) sig m
+  , Has AtomicCounter sig m
+  , Has Debug sig m
+  , Has Logger sig m
+  , Has ReadFS sig m
+  , Has Exec sig m
+  , Has (Output ProjectResult) sig m
+  , Has (Reader AnalyzeExperimentalPreferences) sig m
+  , Has Stack sig m
+  , MonadIO m
+  ) =>
+  -- | Analysis base directory
+  Path Abs Dir ->
+  AllFilters ->
+  DiscoveredProject proj ->
+  m ()
+runDependencyAnalysisForLog4j basedir filters project = do
+  case applyFiltersToProject basedir filters project of
+    Nothing -> logInfo $ "Skipping " <> pretty (projectType project) <> " project at " <> viaShow (projectPath project) <> ": no filters matched"
+    Just targets -> do
+      logInfo $ "Analyzing " <> pretty (projectType project) <> " project at " <> pretty (toFilePath (projectPath project))
+      graphResult <- Diag.runDiagnosticsIO . diagToDebug . stickyLogStack . withEmptyStack . Diag.context "Project Analysis" $ do
+        debugMetadata "DiscoveredProject" project
+        analyzeProject targets (projectData project)
+      Diag.withResult SevWarn SevWarn graphResult (output . mkResult basedir project)
 
 data VulnerableDependency = VulnerableDependency
   { vdName :: Text

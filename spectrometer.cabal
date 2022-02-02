@@ -146,6 +146,7 @@ library
     App.Fossa.Analyze.Log4jReport
     App.Fossa.Analyze.Project
     App.Fossa.Analyze.Record
+    App.Fossa.Analyze.ScanSummary
     App.Fossa.Analyze.Types
     App.Fossa.API.BuildLink
     App.Fossa.API.BuildWait

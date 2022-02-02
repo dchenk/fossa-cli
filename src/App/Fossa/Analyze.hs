@@ -3,8 +3,6 @@
 module App.Fossa.Analyze (
   analyzeMain,
   ScanDestination (..),
-  UnpackArchives (..),
-  JsonOutput (..),
   VSIAnalysisMode (..),
   IATAssertionMode (..),
   BinaryDiscoveryMode (..),
@@ -12,9 +10,9 @@ module App.Fossa.Analyze (
   DiscoverFunc (..),
   discoverFuncs,
   updateProgress,
-  IncludeAll (..),
   runAnalyzers,
   runDependencyAnalysis,
+  applyFiltersToProject,
 ) where
 
 import App.Docs (userGuideUrl)
@@ -22,10 +20,16 @@ import App.Fossa.API.BuildLink (getFossaBuildUrl)
 import App.Fossa.Analyze.Debug (collectDebugBundle, diagToDebug)
 import App.Fossa.Analyze.GraphMangler (graphingToGraph)
 import App.Fossa.Analyze.Project (ProjectResult (..), mkResult)
+import App.Fossa.Analyze.ScanSummary (renderScanSummary)
 import App.Fossa.Analyze.Types (
   AnalyzeExperimentalPreferences (..),
   AnalyzeProject (..),
   AnalyzeTaskEffs,
+  DiscoveredProjectIdentifier (DiscoveredProjectIdentifier, dpiProjectPath),
+  DiscoveredProjectScan (..),
+  IncludeAll (IncludeAll),
+  JsonOutput (JsonOutput),
+  UnpackArchives (UnpackArchives),
  )
 import App.Fossa.BinaryDeps (analyzeBinaryDeps)
 import App.Fossa.FossaAPIV1 (UploadResponse (..), getProject, projectIsMonorepo, uploadAnalysis, uploadContributors)
@@ -71,9 +75,10 @@ import Data.Foldable (traverse_)
 import Data.Functor (void)
 import Data.List (isInfixOf, stripPrefix)
 import Data.List.NonEmpty qualified as NE
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.String.Conversion (decodeUtf8, toText)
 import Data.Text (Text)
+import Diag.Result (Result (Failure, Success), flushLogs, resultToMaybe)
 import Discovery.Archive qualified as Archive
 import Discovery.Filters (AllFilters, applyFilters, filterIsVSIOnly)
 import Discovery.Projects (withDiscoveredProjects)
@@ -95,7 +100,6 @@ import Prettyprinter (
   Doc,
   Pretty (pretty),
   annotate,
-  line,
   viaShow,
   vsep,
  )
@@ -146,11 +150,6 @@ data ScanDestination
   = -- | upload to fossa with provided api key and base url
     UploadScan ApiOpts ProjectMetadata
   | OutputStdout
-
--- CLI flags, for use with 'Data.Flag'
-data UnpackArchives = UnpackArchives
-data IncludeAll = IncludeAll
-data JsonOutput = JsonOutput
 
 -- | Collect analysis modes into a single type for ease of use.
 -- These modes are intended to be different options that alter how analysis is performed or what analysis steps are followed.
@@ -223,7 +222,7 @@ runDependencyAnalysis ::
   , Has Logger sig m
   , Has ReadFS sig m
   , Has Exec sig m
-  , Has (Output ProjectResult) sig m
+  , Has (Output DiscoveredProjectScan) sig m
   , Has (Reader AnalyzeExperimentalPreferences) sig m
   , Has Stack sig m
   , MonadIO m
@@ -234,14 +233,19 @@ runDependencyAnalysis ::
   DiscoveredProject proj ->
   m ()
 runDependencyAnalysis basedir filters project = do
+  let dpi = DiscoveredProjectIdentifier (projectPath project) (projectType project)
   case applyFiltersToProject basedir filters project of
-    Nothing -> logInfo $ "Skipping " <> pretty (projectType project) <> " project at " <> viaShow (projectPath project) <> ": no filters matched"
+    Nothing -> do
+      logInfo $ "Skipping " <> pretty (projectType project) <> " project at " <> viaShow (projectPath project) <> ": no filters matched"
+      output $ SkippedDueToProvidedFilter dpi
     Just targets -> do
       logInfo $ "Analyzing " <> pretty (projectType project) <> " project at " <> pretty (toFilePath (projectPath project))
       graphResult <- Diag.runDiagnosticsIO . diagToDebug . stickyLogStack . withEmptyStack . Diag.context "Project Analysis" $ do
         debugMetadata "DiscoveredProject" project
         analyzeProject targets (projectData project)
-      Diag.withResult SevWarn SevWarn graphResult (output . mkResult basedir project)
+
+      flushLogs SevWarn SevWarn graphResult
+      output $ Scanned dpi (mkResult basedir project <$> graphResult)
 
 applyFiltersToProject :: Path Abs Dir -> AllFilters -> DiscoveredProject n -> Maybe FoundTargets
 applyFiltersToProject basedir filters DiscoveredProject{..} =
@@ -255,7 +259,7 @@ applyFiltersToProject basedir filters DiscoveredProject{..} =
 
 runAnalyzers ::
   ( AnalyzeTaskEffs sig m
-  , Has (Output ProjectResult) sig m
+  , Has (Output DiscoveredProjectScan) sig m
   , Has TaskPool sig m
   , Has AtomicCounter sig m
   ) =>
@@ -354,26 +358,32 @@ analyze (BaseDir basedir) destination override unpackArchives jsonOutput include
         OutputStdout -> Nothing
         UploadScan opts _ -> Just opts
 
-  -- additional source units are built outside the standard strategy flow, because they either
+  -- Additional source units are built outside the standard strategy flow, because they either
   -- require additional information (eg API credentials), or they return additional information (eg user deps).
   vsiResults <-
-    Diag.context "analyze-vsi" . runStickyLogger SevInfo . runFinally $
-      analyzeVSI modeVSIAnalysis apiOpts basedir override filters modeVSISkipResolution
-  binarySearchResults <-
-    Diag.context "discover-binaries" $
-      analyzeDiscoverBinaries modeBinaryDiscovery basedir filters
-  manualSrcUnits <-
-    if filterIsVSIOnly filters
-      then do
-        logInfo "Running in VSI only mode, skipping manual source units"
-        pure Nothing
-      else Diag.context "fossa-deps" . runStickyLogger SevInfo $ analyzeFossaDepsFile basedir apiOpts
-  let additionalSourceUnits :: [SourceUnit]
-      additionalSourceUnits = catMaybes [manualSrcUnits, vsiResults, binarySearchResults]
+    Diag.runDiagnosticsIO . diagToDebug $
+      Diag.context "analyze-vsi" . runStickyLogger SevInfo . runFinally $
+        analyzeVSI modeVSIAnalysis apiOpts basedir override filters modeVSISkipResolution
 
-  (projectResults, ()) <-
+  binarySearchResults <-
+    Diag.runDiagnosticsIO . diagToDebug $
+      Diag.context "discover-binaries" $
+        analyzeDiscoverBinaries modeBinaryDiscovery basedir filters
+
+  manualSrcUnits <-
+    Diag.runDiagnosticsIO . diagToDebug $
+      if filterIsVSIOnly filters
+        then do
+          logInfo "Running in VSI only mode, skipping manual source units"
+          pure Nothing
+        else Diag.context "fossa-deps" . runStickyLogger SevInfo $ analyzeFossaDepsFile basedir apiOpts
+
+  let additionalSourceUnits :: [SourceUnit]
+      additionalSourceUnits = catMaybes $ mapMaybe resultToMaybe [manualSrcUnits, vsiResults, binarySearchResults]
+
+  (projectScans, ()) <-
     Diag.context "discovery/analysis tasks"
-      . runOutput @ProjectResult
+      . runOutput @DiscoveredProjectScan
       . runStickyLogger SevInfo
       . runFinally
       . withTaskPool capabilities updateProgress
@@ -385,12 +395,16 @@ analyze (BaseDir basedir) destination override unpackArchives jsonOutput include
             res <- Diag.runDiagnosticsIO . diagToDebug . stickyLogStack . withEmptyStack $ Archive.discover (`runAnalyzers` filters) basedir
             Diag.withResult SevError SevWarn res (const (pure ()))
 
-  let filteredProjects = filterProjects (BaseDir basedir) projectResults
+  let projectScansWithSkippedProdPath = productionPathFilter (BaseDir basedir) projectScans
+  let projectResults = mapMaybe toProjectResult projectScans
+  let filteredProjects = mapMaybe toProjectResult projectScansWithSkippedProdPath
+
+  _ <- renderScanSummary projectScansWithSkippedProdPath vsiResults binarySearchResults manualSrcUnits
 
   -- Need to check if vendored is empty as well, even if its a boolean that vendoredDeps exist
   case checkForEmptyUpload includeAll projectResults filteredProjects additionalSourceUnits of
     NoneDiscovered -> Diag.fatal ErrNoProjectsDiscovered
-    FilteredAll count -> Diag.fatal (ErrFilteredAllProjects count projectResults)
+    FilteredAll -> Diag.fatal ErrFilteredAllProjects
     FoundSome sourceUnits -> case destination of
       OutputStdout -> do
         debugScope "DEBUG: Project inference" $ do
@@ -403,6 +417,11 @@ analyze (BaseDir basedir) destination override unpackArchives jsonOutput include
       UploadScan opts metadata -> Diag.context "upload-results" $ do
         locator <- uploadSuccessfulAnalysis (BaseDir basedir) opts metadata jsonOutput override sourceUnits
         doAssertRevisionBinaries modeIATAssertion opts locator
+
+toProjectResult :: DiscoveredProjectScan -> Maybe ProjectResult
+toProjectResult (SkippedDueToProvidedFilter _) = Nothing
+toProjectResult (SkippedDueToDefaultProductionFilter _) = Nothing
+toProjectResult (Scanned _ res) = resultToMaybe res
 
 analyzeVSI ::
   ( Has Diag.Diagnostics sig m
@@ -459,7 +478,7 @@ dieOnMonorepoUpload apiOpts revision = do
 
 data AnalyzeError
   = ErrNoProjectsDiscovered
-  | ErrFilteredAllProjects Int [ProjectResult]
+  | ErrFilteredAllProjects
 
 instance Diag.ToDiagnostic AnalyzeError where
   renderDiagnostic :: AnalyzeError -> Doc ann
@@ -471,16 +490,19 @@ instance Diag.ToDiagnostic AnalyzeError where
       , "    " <> pretty userGuideUrl
       , ""
       ]
-  renderDiagnostic (ErrFilteredAllProjects count projectResults) =
-    "Filtered out all "
-      <> pretty count
-      <> " projects due to directory name, and no manual deps were found."
-      <> line
-      <> line
-      <> vsep (map renderExcludedProject projectResults)
-    where
-      renderExcludedProject :: ProjectResult -> Doc ann
-      renderExcludedProject project = "Excluded by directory name: " <> pretty (toFilePath $ projectResultPath project)
+  renderDiagnostic (ErrFilteredAllProjects) =
+    vsep
+      [ "Filtered out all projects. This may be occurring because: "
+      , ""
+      , " * No manual or vendor dependencies were provided with `fossa-deps` file."
+      , " * Exclusion filters were used, filtering out discovered projects. "
+      , " * Discovered projects resided in following ignored path by default:"
+      , vsep $ map (\i -> pretty $ "    * " <> toText i) notProductionPath
+      , ""
+      , "See the user guide for details:"
+      , "    " <> pretty userGuideUrl
+      , ""
+      ]
 
 uploadSuccessfulAnalysis ::
   ( Has Diag.Diagnostics sig m
@@ -512,15 +534,15 @@ uploadSuccessfulAnalysis (BaseDir basedir) apiOpts metadata jsonOutput override 
   uploadResult <- uploadAnalysis apiOpts revision metadata units
   let locator = parseLocator $ uploadLocator uploadResult
   buildUrl <- getFossaBuildUrl revision apiOpts locator
-  logInfo $
-    vsep
-      [ "============================================================"
-      , ""
-      , "    View FOSSA Report:"
-      , "    " <> pretty buildUrl
-      , ""
-      , "============================================================"
-      ]
+  traverse_
+    logInfo
+    [ "============================================================"
+    , ""
+    , "    View FOSSA Report:"
+    , "    " <> pretty buildUrl
+    , ""
+    , "============================================================"
+    ]
   traverse_ (\err -> logError $ "FOSSA error: " <> viaShow err) (uploadError uploadResult)
   -- Warn on contributor errors, never fail
   void . Diag.recover . runExecIO $ tryUploadContributors basedir apiOpts (uploadLocator uploadResult)
@@ -543,7 +565,7 @@ inferProjectRevision basedir override = do
 
 data CountedResult
   = NoneDiscovered
-  | FilteredAll Int
+  | FilteredAll
   | FoundSome (NE.NonEmpty SourceUnit)
 
 -- | Return some state of the projects found, since we can't upload empty result arrays.
@@ -557,8 +579,8 @@ checkForEmptyUpload includeAll xs ys additionalUnits = do
       -- We didn't discover, so we also didn't filter
       (0, 0) -> NoneDiscovered
       -- If either list is empty, we have nothing to upload
-      (0, _) -> FilteredAll filterCount
-      (_, 0) -> FilteredAll filterCount
+      (0, _) -> FilteredAll
+      (_, 0) -> FilteredAll
       -- NE.fromList is a partial, but is safe since we confirm the length is > 0.
       _ -> FoundSome $ NE.fromList discoveredUnits
     else -- If we have a additional source units, then there's always something to upload.
@@ -566,43 +588,63 @@ checkForEmptyUpload includeAll xs ys additionalUnits = do
   where
     xlen = length xs
     ylen = length ys
-    filterCount = abs $ xlen - ylen
+
     -- The smaller list is the post-filter list, since filtering cannot add projects
     filtered = if xlen > ylen then ys else xs
     discoveredUnits = map (Srclib.toSourceUnit (fromFlag IncludeAll includeAll)) filtered
 
--- For each of the projects, we need to strip the root directory path from the prefix of the project path.
--- We don't want parent directories of the scan root affecting "production path" filtering -- e.g., if we're
--- running in a directory called "tmp", we still want results.
-filterProjects :: BaseDir -> [ProjectResult] -> [ProjectResult]
-filterProjects rootDir = filter (isProductionPath . dropPrefix rootPath . fromAbsDir . projectResultPath)
+productionPathFilter :: BaseDir -> [DiscoveredProjectScan] -> [DiscoveredProjectScan]
+productionPathFilter dir = map (applyDefaultProductionPathFilter dir)
+
+-- | Apply production path filtering.
+-- -
+-- For each of the projects, we strip the root directory path from the prefix of the project path.
+-- We don't want parent directories of the scan root affecting "production path" filtering -- e.g.,
+-- if we're running in a directory called "tmp", we still want results.
+applyDefaultProductionPathFilter :: BaseDir -> DiscoveredProjectScan -> DiscoveredProjectScan
+applyDefaultProductionPathFilter _ (SkippedDueToProvidedFilter a) = SkippedDueToProvidedFilter a
+applyDefaultProductionPathFilter _ (SkippedDueToDefaultProductionFilter a) = SkippedDueToDefaultProductionFilter a
+applyDefaultProductionPathFilter dir (Scanned dpi result) = case result of
+  Failure _ _ ->
+    if isInProdPath $ dpiProjectPath dpi
+      then Scanned dpi result
+      else SkippedDueToDefaultProductionFilter dpi
+  Success _ res ->
+    if isInProdPath $ projectResultPath res
+      then Scanned dpi result
+      else SkippedDueToDefaultProductionFilter dpi
   where
-    rootPath = fromAbsDir $ unBaseDir rootDir
+    isInProdPath :: Path Abs Dir -> Bool
+    isInProdPath = isProductionPath . dropPrefix rootPath . fromAbsDir
+
+    rootPath :: FilePath
+    rootPath = fromAbsDir $ unBaseDir dir
+
     dropPrefix :: String -> String -> String
     dropPrefix prefix str = fromMaybe prefix (stripPrefix prefix str)
 
 isProductionPath :: FilePath -> Bool
-isProductionPath path =
-  not $
-    any
-      (`isInfixOf` path)
-      [ "doc/"
-      , "docs/"
-      , "test/"
-      , "example/"
-      , "examples/"
-      , "vendor/"
-      , "node_modules/"
-      , ".srclib-cache/"
-      , "spec/"
-      , "Godeps/"
-      , ".git/"
-      , "bower_components/"
-      , "third_party/"
-      , "third-party/"
-      , "Carthage/"
-      , "Checkouts/"
-      ]
+isProductionPath path = not $ any (`isInfixOf` path) notProductionPath
+
+notProductionPath :: [[Char]]
+notProductionPath =
+  [ "doc/"
+  , "docs/"
+  , "test/"
+  , "example/"
+  , "examples/"
+  , "vendor/"
+  , "node_modules/"
+  , ".srclib-cache/"
+  , "spec/"
+  , "Godeps/"
+  , ".git/"
+  , "bower_components/"
+  , "third_party/"
+  , "third-party/"
+  , "Carthage/"
+  , "Checkouts/"
+  ]
 
 tryUploadContributors ::
   ( Has Diag.Diagnostics sig m
